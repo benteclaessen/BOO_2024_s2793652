@@ -1,0 +1,620 @@
+---
+title: "BOO2024 - Hands-on workshop DEG analysis"
+author: "Imke Bruns (MSc), Steven Kunnen (PhD), Giulia Callegaro (PhD), Hugo van Kessel (Msc)"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    theme: default
+    highlight: kate
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+# Setup {.tabset}
+```{r include=FALSE, echo=TRUE, message=FALSE}
+rm(list = ls()); gc()
+knitr::opts_chunk$set(tidy.opts = list(width.cutoff = 80), tidy = TRUE)
+```
+
+## Load packages
+### CRAN
+```{r}
+# Check if pacman is available and install
+if(!require("pacman", quietly = T)){install.packages("pacman")}; library(pacman)
+
+# use packman to install CRAN packages
+p_load(tidyverse, data.table, enrichR, fgsea)
+```
+
+## Set directories
+```{r}
+# input directory
+if(!dir.exists("INPUT")){
+  dir.create(path = file.path(getwd(), "INPUT"))
+}
+input_dir <- file.path(getwd(), "INPUT")
+
+# output directory
+if(!dir.exists("OUTPUT")){
+  dir.create(path = file.path(getwd(), "OUTPUT"))
+}
+output_dir <- file.path(getwd(), "OUTPUT")
+
+```
+
+## Load functions
+```{r}
+
+
+runEnrichR = function(genes) {
+  enrichR = enrichr(
+    genes = genes,
+    databases = c(
+      "BioCarta_2016",
+      "HumanCyc_2016",
+      "KEGG_2021_Human",
+      "Reactome_2022",
+      "WikiPathway_2021_Human",
+      "InterPro_Domains_2019",
+      "GO_Molecular_Function_2023",
+      "GO_Cellular_Component_2023",
+      "GO_Biological_Process_2023"
+    )
+  ) 
+  
+  enrichR = rbindlist(enrichR, idcol = T)
+  names(enrichR)[1:2] = c("database", "source")
+  return(enrichR)
+}
+
+```
+
+# Load data {.tabset}
+## Metadata
+```{r}
+metadata = fread(file.path(input_dir, "20240603filtered_metadata_processed_human.csv"))
+
+```
+
+
+## DESeq2 output
+```{r}
+deseq_results = readRDS(file.path(output_dir, "20240603_DESeq2_results_unformatted_human2.rds"))
+
+```
+
+# Human gene NCBI database
+```{r}
+human_ncbi = fread(input = "https://ftp.ncbi.nlm.nih.gov/gene/DATA/GENE_INFO/Mammalia/Homo_sapiens.gene_info.gz", 
+                   stringsAsFactors = FALSE, 
+                   fill = TRUE) %>%
+  tibble() %>%
+  select("gene_symbol" = Symbol,
+         "synonym" = Synonyms,
+         "entrez_id" = GeneID,
+         "dbxrefs" = dbXrefs,
+         "modification_date" = Modification_date) %>%
+  distinct() %>%
+  mutate(dbxrefs = paste0(dbxrefs, "|")) %>%
+  mutate(gene_symbol = gene_symbol,
+         entrez_id = as.character(entrez_id),
+         ensembl_id = str_extract(string = dbxrefs, "(?<=embl:)(.*?)(?=\\|)"),
+         hgnc_id = str_extract(string = dbxrefs, "(?<=HGNC:HGNC:)(.*?)(?=\\|)"),
+         mim_id = str_extract(string = dbxrefs, "(?<=MIM:)(.*?)(?=\\|)"),
+         alliancegenome_id = str_extract(string = dbxrefs, "(?<=AllianceGenome:HGNC:)(.*?)(?=\\|)")) %>%
+  select(gene_symbol, entrez_id, ensembl_id, hgnc_id, mim_id, alliancegenome_id, modification_date) %>%
+  mutate(user_date = format(Sys.time(), "%Y%m%d"))
+```
+
+# Rat gene NCBI database
+```{r include=TRUE, echo=TRUE, message=FALSE}
+rat_ncbi = fread(input = "https://ftp.ncbi.nlm.nih.gov/gene/DATA/GENE_INFO/Mammalia/Rattus_norvegicus.gene_info.gz", 
+                 stringsAsFactors = FALSE, 
+                 fill = TRUE) %>%
+  tibble() %>%
+  select("gene_symbol" = Symbol,
+         "synonym" = Synonyms,
+         "entrez_id" = GeneID,
+         "dbxrefs" = dbXrefs,
+         "modification_date" = Modification_date) %>%
+  distinct() %>%
+  mutate(dbxrefs = paste0(dbxrefs, "|")) %>%
+  mutate(gene_symbol = gene_symbol,
+         entrez_id = as.character(entrez_id),
+         rgd_id = str_extract(string = dbxrefs, "(?<=RGD:)(.*?)(?=\\|)"),
+         ensembl_id = str_extract(string = dbxrefs, "(?<=embl:)(.*?)(?=\\|)"),
+         alliancegenome_id = str_extract(string = dbxrefs, "(?<=AllianceGenome:RGD:)(.*?)(?=\\|)")) %>%
+  select(gene_symbol, entrez_id, ensembl_id,rgd_id, alliancegenome_id, modification_date) %>%
+  mutate(user_date = format(Sys.time(), "%Y%m%d"))
+```
+
+```{r}
+human_rgd <- fread(input = "https://download.rgd.mcw.edu/data_release/HUMAN/ORTHOLOGS_HUMAN.txt",
+                 stringsAsFactors = FALSE, 
+                 fill = TRUE, 
+                 skip = 15, 
+                 header = "auto", 
+                 na.strings = c(NA_character_, ""))
+ 
+human_rgd <- human_rgd[, !duplicated(colnames(human_rgd)), with = F] %>% data.frame() %>% 
+  select(HUMAN_GENE_SYMBOL,
+         HUMAN_GENE_NCBI_GENE_ID,
+         RAT_GENE_SYMBOL,
+         RAT_GENE_NCBI_GENE_ID) %>% tibble()
+ 
+# update rat_rgd with the most recent gene_symbols
+human_rgd$RAT_GENE_SYMBOL <- rat_ncbi$gene_symbol[match(human_rgd$RAT_GENE_NCBI_GENE_ID,rat_ncbi$entrez_id)]
+human_rgd$HUMAN_GENE_SYMBOL <- human_ncbi$gene_symbol[match(human_rgd$HUMAN_GENE_NCBI_GENE_ID,human_ncbi$entrez_id)]
+
+```
+```{r}
+deseq_results = deseq_results |>
+  mutate(HUMAN_GENE_SYMBOL = gene_symbol) |> 
+  left_join(human_rgd)
+```
+```{r}
+deseq_results_filtered <- deseq_results[!is.na(deseq_results$RAT_GENE_SYMBOL), ]
+```
+
+```{r}
+gmt_hallmarks = gmtPathways("msigdb_v2023.2.Hs_GMTs/h.all.v2023.2.Hs.symbols.gmt")
+gmt_wikipathways = gmtPathways("msigdb_v2023.2.Hs_GMTs/c2.cp.wikipathways.v2023.2.Hs.symbols.gmt")
+gmt_reactome = gmtPathways("msigdb_v2023.2.Hs_GMTs/c2.cp.reactome.v2023.2.Hs.symbols.gmt")
+
+# gmt_wikipathways = gmtPathways(file.path(
+#   input_dir,
+#   "GSEA_PATHWAYS",
+#   "wikipathways.v2023.2.Hs.symbols.gmt"
+# ))
+
+# show the first few pathways, and within those, show the first few genes
+gmt_wikipathways %>% head() %>% lapply(head)
+```
+```{r}
+expression_long <- deseq_results_filtered %>%
+  dplyr::select(sample_id = MEAN_ID_TREATMENT,
+                gene_symbol,
+                log2fc = log2FoldChange,
+                pvalue,
+                padj)
+
+# Voeg kolommen toe zoals nodig voor TXG-MAPr
+expression_long_TXG <- left_join(expression_long, metadata %>%
+                                   dplyr::select("experiment" = "COMPOUND", "time" = "TIME", "conc" = "CONCENTRATION", "sample_id" = "MEAN_ID"),
+                                 by = c("sample_id")) %>%
+  dplyr::rename("gene_id" = "gene_symbol") %>%
+  mutate(time = gsub("hr", "", time), # remove hr from time
+         conc = gsub("uM", "", conc))
+
+# Hernoemen van elke unieke experiment waarde op basis van sample_id
+expression_long_TXG <- expression_long_TXG %>%
+  mutate(experiment = case_when(
+    sample_id == "HPPTEC_CSA_8hr_2" ~ "1CYCLOSPORIN A",
+    sample_id == "HPPTEC_CSA_8hr_10" ~ "2CYCLOSPORIN A",
+    sample_id == "HPPTEC_CSA_8hr_40" ~ "3CYCLOSPORIN A",
+    sample_id == "HPPTEC_CSA_24hr_2" ~ "4CYCLOSPORIN A",
+    sample_id == "HPPTEC_CSA_24hr_10" ~ "5CYCLOSPORIN A",
+    sample_id == "HPPTEC_CSA_24hr_40" ~ "6CYCLOSPORIN A",
+    sample_id == "HPPTEC_CSA_72hr_2" ~ "7CYCLOSPORIN A",
+    sample_id == "HPPTEC_CSA_72hr_10" ~ "8CYCLOSPORIN A",
+    sample_id == "HPPTEC_CSA_72hr_40" ~ "9CYCLOSPORIN A",
+    TRUE ~ experiment 
+  ))
+
+# Verwijder eventueel originele sample_id kolom als die niet meer nodig is
+expression_long_TXG <- expression_long_TXG %>%
+  select(-sample_id)
+```
+```{r}
+write_delim(expression_long_TXG, file.path(output_dir, paste0(gsub( "-", "", Sys.Date()), "_renamed_expression_long_TXG_upload_human.txt")))
+```
+
+# Overrepresentation analysis
+```{r error=F,warning=F,message=F}
+
+# We set the threshold for significant genes
+padj_threshold <- 0.05
+
+# We perform ORA analysis using EnrichR
+ora <- deseq_results_filtered %>%
+  filter(padj < padj_threshold) %>%
+  nest_by(MEAN_ID_TREATMENT) %>%
+  mutate(significant_genes = list(data %>%
+                                    arrange(padj) %>%
+                                    # slice(1:50) %>%
+                                    pull(gene_symbol))) %>%
+  mutate(ora = list(
+    runEnrichR(genes = significant_genes) %>% filter(Adjusted.P.value < 0.05)
+  ))
+
+
+# print the output
+for (i in ora$MEAN_ID_TREATMENT) {
+  print(paste0("Top 10 significant ORA for ", i))
+  print(
+    ora %>%
+      filter(MEAN_ID_TREATMENT == i) %>%
+      select(MEAN_ID_TREATMENT, ora) %>%
+      unnest(cols = c(ora)) %>%
+      select(MEAN_ID_TREATMENT, database, source, Adjusted.P.value, Genes) %>%
+      arrange(Adjusted.P.value) %>%
+      ungroup() %>%
+      dplyr::slice(1:20)
+  )
+}
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Functie om de top 10 laagste Adjusted.P.values per conditie te selecteren
+get_top_adjusted_p <- function(df, n = 10) {
+  df %>%
+    arrange(Adjusted.P.value) %>%
+    slice_head(n = n)
+}
+
+# Combineer de top resultaten per conditie
+combined_top_ora <- ora %>%
+  tidyr::unnest(cols = c(ora)) %>%
+  group_by(MEAN_ID_TREATMENT) %>%
+  do(get_top_adjusted_p(., 10)) %>%
+  ungroup()
+
+# Maak de dotplot met aangepast kleurenpalet voor de schaal
+p_ora_combined <- ggplot(combined_top_ora, aes(x = MEAN_ID_TREATMENT, y = source, color = Adjusted.P.value)) +
+  geom_point() +
+  scale_size_continuous(range = c(1, 10)) +
+  scale_color_gradientn(colors = c("darkblue", "blue", "cyan", "yellow", "red"), trans = "log") +  
+  labs(
+    title = "Top 10 Pathways by Lowest Adjusted P-value per Condition (ORA)",
+    x = "MEAN_ID_TREATMENT",
+    y = "Source",
+    size = 1,
+    color = "Adjusted P-value"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 4),
+    plot.title = element_text(size = 8) 
+  )
+
+# Toon de dotplot
+print(p_ora_combined)
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+
+# Ensure the ORA data is processed and structured correctly
+fix_column_types <- function(df) {
+  df %>%
+    mutate(
+      database = as.character(database),
+      source = as.character(source),
+      Adjusted.P.value = as.numeric(Adjusted.P.value)
+    )
+}
+
+ora_heatmap <- ora %>%
+  rowwise() %>%
+  mutate(ora = list(fix_column_types(ora)))
+
+# Function to get top 20 lowest Adjusted.P.values per condition
+get_top_adjusted_p <- function(df, n = 20) {
+  df %>%
+    arrange(Adjusted.P.value) %>%
+    slice_head(n = n)
+}
+
+# Combine the top results per condition
+combined_top_ora <- ora_heatmap %>%
+  tidyr::unnest(cols = c(ora)) %>%
+  group_by(MEAN_ID_TREATMENT) %>%
+  do(get_top_adjusted_p(., 20)) %>%
+  ungroup()
+
+combined_top_ora <- combined_top_ora %>%
+  filter(Adjusted.P.value < 0.05)
+
+## Transform data to make a heatmap
+
+heatmap_data <- combined_top_ora %>%
+  select(MEAN_ID_TREATMENT, source, Adjusted.P.value) %>%
+  pivot_wider(names_from = MEAN_ID_TREATMENT, values_from = Adjusted.P.value)
+
+# Replace NA values with a high value (indicating non-significance) for better visualization
+heatmap_data[is.na(heatmap_data)] <- 1
+#heatmap_data[heatmap_data] <- NA
+
+# Convert to matrix for heatmap plotting
+heatmap_matrix <- as.matrix(heatmap_data[,-1])
+rownames(heatmap_matrix) <- heatmap_data$source
+```
+
+```{r}
+heatmap_long <- as.data.frame(as.table(heatmap_matrix))
+
+ggplot(heatmap_long, aes(x = Var2, y = Var1, fill = Freq)) +
+  geom_tile(color = "white") +  # Gebruik geom_tile voor de heatmap
+  scale_fill_viridis(
+    option = "viridis",  
+    trans = "log", 
+    na.value = "grey", 
+    limits = c(min(heatmap_long$Freq, na.rm = TRUE), 0.05), 
+    breaks = c(min(heatmap_long$Freq, na.rm = TRUE), 0.05)
+                         
+                         ) +
+  labs(
+    title = "Top 20 Pathways by Lowest Adjusted P-value per Condition (ORA)",
+    x = "MEAN_ID_TREATMENT",
+    y = "Source",
+    fill = "Adjusted P-value"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 5),
+    plot.title = element_text(size = 12)
+  )
+```
+```{r}
+write_rds(heatmap_long, file.path(output_dir, paste0(gsub( "-", "", Sys.Date()), "_heatmap_long_human.rds")))
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Selecteer pathways die in meerdere behandelingen voorkomen
+pathway_counts <- combined_top_ora %>%
+  count(source, sort = TRUE) %>%
+  filter(n > 1) %>%
+  select(source)
+
+# Filter de gecombineerde ORA-resultaten om alleen deze pathways op te nemen
+filtered_combined_top_ora <- combined_top_ora %>%
+  filter(source %in% pathway_counts$source)
+
+# Transformeer data voor het maken van een heatmap
+heatmap_data <- filtered_combined_top_ora %>%
+  select(MEAN_ID_TREATMENT, source, Adjusted.P.value) %>%
+  pivot_wider(names_from = MEAN_ID_TREATMENT, values_from = Adjusted.P.value)
+
+# Vervang NA-waarden door een hoge waarde (aangevende niet-significantie) voor betere visualisatie
+heatmap_data[is.na(heatmap_data)] <- 1
+
+# Converteer naar matrix voor heatmap plotten
+heatmap_matrix <- as.matrix(heatmap_data[,-1])
+rownames(heatmap_matrix) <- heatmap_data$source
+
+heatmap_long <- as.data.frame(as.table(heatmap_matrix))
+
+# Maak de heatmap met aangepast kleurenpalet voor de schaal
+ggplot(heatmap_long, aes(x = Var2, y = Var1, fill = Freq)) +
+  geom_tile(color = "white") +  # Gebruik geom_tile voor de heatmap
+  scale_fill_viridis(
+    option = "viridis",
+    trans = "log", 
+    na.value = "grey", 
+    limits = c(min(heatmap_long$Freq, na.rm = TRUE), 0.05), 
+    breaks = c(min(heatmap_long$Freq, na.rm = TRUE), 0.05)
+  ) +
+  labs(
+    title = "Overlapping Pathways Of The Top 20 by Lowest Adjusted P-value per Condition (ORA)",
+    x = "MEAN_ID_TREATMENT",
+    y = "Source",
+    fill = "Adjusted P-value"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 4, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 4),
+    plot.title = element_text(size = 5)
+  )
+```
+
+# Gene set enrichment analysis {.tabset}
+## Run fgsea
+```{r}
+deseq_results_test = deseq_results_filtered %>% separate(gene_symbol,
+                                                into = c("gene_symbol", "probe_nr"),
+                                                sep = "_") %>%
+  group_by(MEAN_ID_TREATMENT) %>%
+  distinct(gene_symbol, .keep_all = TRUE) %>% ungroup()
+
+combined_gmt <- c(gmt_wikipathways, gmt_hallmarks, gmt_reactome)
+
+gsea <- deseq_results_test %>%
+  nest_by(MEAN_ID_TREATMENT) %>%
+  mutate(ranked_genes = list(
+    data %>% arrange(stat) %>% select(gene_symbol, stat) %>% deframe()
+  )) %>%
+  mutate(fgsea_output = list(fgsea(pathways = combined_gmt, 
+                                   stats = ranked_genes)))
+
+
+# print the output
+for (i in gsea$MEAN_ID_TREATMENT) {
+  print(paste0("Top 10 significant pathways for ", i))
+  print(
+    gsea %>%
+      filter(MEAN_ID_TREATMENT == i) %>%
+      select(MEAN_ID_TREATMENT, fgsea_output) %>%
+      unnest(cols = c(fgsea_output)) %>%
+      select(MEAN_ID_TREATMENT, pathway, padj, NES) %>%
+      arrange(desc(abs(NES))) %>%
+      ungroup() %>%
+      slice(1:20)
+  )
+}
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Select needed columns with unnest
+gsea_results_heatmap <- gsea %>%
+  unnest(cols = c(fgsea_output)) %>%
+  select(MEAN_ID_TREATMENT, pathway, NES) %>%
+  ungroup()
+
+# Select top 20 NES for each treatment condition
+get_top_abs_nes <- function(df, n = 20) {
+  df %>%
+    mutate(abs_NES = abs(NES)) %>%
+    arrange(desc(abs_NES)) %>%
+    slice_head(n = n) %>%
+    select(-abs_NES)
+}
+
+# Combine for visualization
+combined_top_results <- gsea_results_heatmap %>%
+  group_by(MEAN_ID_TREATMENT) %>%
+  do(get_top_abs_nes(., 20)) %>%
+  ungroup()
+
+# Transform data to wide format for heatmap plotting
+heatmap_data_GSEA <- combined_top_results %>%
+  select(MEAN_ID_TREATMENT, pathway, NES) %>%
+  pivot_wider(names_from = MEAN_ID_TREATMENT, values_from = NES)
+
+# Convert to matrix for heatmap plotting
+heatmap_matrix_GSEA <- as.matrix(heatmap_data_GSEA[,-1])
+rownames(heatmap_matrix_GSEA) <- heatmap_data_GSEA$pathway
+
+# Convert matrix to long format for ggplot2
+heatmap_long_GSEA <- as.data.frame(as.table(heatmap_matrix_GSEA))
+
+# Plot the heatmap
+ggplot(heatmap_long_GSEA, aes(Var2, Var1, fill = Freq)) +
+  geom_tile(color = "white") +
+   scale_fill_viridis_c(option = "viridis",
+    na.value = "grey"
+  ) +
+  labs(
+    title = "Heatmap of Top 20 Pathways by Absolute NES per Condition",
+    x = "Condition",
+    y = "Pathway",
+    fill = "NES"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 4),
+    plot.title = element_text(size = 10, hjust = 0.5)
+  )
+```
+```{r}
+filtered_heatmap_long_GSEA <- heatmap_long_GSEA[!is.na(heatmap_long_GSEA$Freq), ]
+```
+
+```{r}
+write_rds(heatmap_long_GSEA, file.path(output_dir, paste0(gsub( "-", "", Sys.Date()), "_heatmap_long_GSEA_human.rds")))
+```
+
+```{r}
+# Bereken de frequentie van elke pathway in de top 20 per conditie
+pathway_frequency <- combined_top_results %>%
+  count(pathway) %>%
+  filter(n > 1) %>%
+  pull(pathway)
+
+# Selecteer alleen de resultaten voor de overlappende pathways
+overlapping_results <- combined_top_results %>%
+  filter(pathway %in% pathway_frequency)
+
+# Voor het vullen van de scale_fill_viridis
+pathways_multiple_conditions <- overlapping_results
+
+# Plot de heatmap met alleen de overlappende pathways
+ggplot(overlapping_results, aes(x = MEAN_ID_TREATMENT, y = pathway, fill = NES)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "viridis", na.value = "grey",
+                     limits = c(min(pathways_multiple_conditions$NES, na.rm = TRUE), 
+                                max(pathways_multiple_conditions$NES, na.rm = TRUE)), 
+                     breaks = seq(min(pathways_multiple_conditions$NES, na.rm = TRUE), 
+                                  max(pathways_multiple_conditions$NES, na.rm = TRUE), length.out = 5)
+  ) + 
+  labs(
+    title = "Heatmap of Top Pathways by NES (Multiple Conditions)",
+    x = "Condition",
+    y = "Pathway",
+    fill = "NES"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 5, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 5),
+    plot.title = element_text(size = 10)
+  )
+```
+
+```{r}
+# Laad de benodigde libraries
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(tidyr)
+
+# Lees de datasets in
+combined_top_results_human <- readRDS(file.path(output_dir, "20240619_heatmap_long_GSEA_human.rds"))
+combined_top_results_rat <- readRDS(file.path(output_dir, "20240618_heatmap_long_GSEA_rat.rds"))
+
+# Voeg een kolom toe om de soort aan te geven
+combined_top_results_human <- combined_top_results_human %>% mutate(Species = "Human")
+combined_top_results_rat <- combined_top_results_rat %>% mutate(Species = "Rat")
+
+# Combineer de dataframes
+combined_top_results <- bind_rows(combined_top_results_human, combined_top_results_rat)
+
+# Identificeer overlappende pathways
+overlapping_pathways <- combined_top_results %>%
+  group_by(Var1) %>%
+  filter(n_distinct(Species) > 1) %>%
+  pull(Var1) %>%
+  unique()
+
+# Filter de dataframes voor alleen overlappende pathways
+filtered_results <- combined_top_results %>%
+  filter(Var1 %in% overlapping_pathways)
+
+# Maak de heatmap
+p_combined_heatmap <- ggplot(filtered_results, aes(x = Var2, y = Var1, fill = Freq)) +
+  geom_tile(color = "white") +
+  facet_grid(. ~ Species, scales = "free", space = "free") +  # Facet per Species
+  scale_fill_viridis(option = "viridis", na.value = "#D3D3D3") +
+  labs(
+    title = "Top Pathways by Absolute NES for Rat and Human",
+    x = "Condition",
+    y = "Pathway",
+    fill = "NES"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 5),
+    axis.text.x = element_text(size = 6, angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5, size = 10),
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 8),
+    strip.text = element_text(size = 8)
+  )
+
+# Toon de heatmap
+print(p_combined_heatmap)
+
+```

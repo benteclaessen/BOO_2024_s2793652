@@ -1,0 +1,338 @@
+---
+title: "BOO2024 - Hands-on workshop DEG analysis"
+author: "Imke Bruns (MSc), Steven Kunnen (PhD), Giulia Callegaro (PhD), Hugo van Kessel (Msc)"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    theme: default
+    highlight: kate
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+# Setup {.tabset}
+```{r include=FALSE, echo=TRUE, message=FALSE}
+rm(list = ls()); gc()
+knitr::opts_chunk$set(tidy.opts = list(width.cutoff = 80), tidy = TRUE)
+```
+
+## Load packages
+### Bioconductor
+```{r}
+# Check if BiocManager is available and install
+if(!require("BiocManager", quietly = T)){install.packages("BiocManager")}; library(BiocManager)
+
+# Check if BiocManager is available and install
+if(!require("DESeq2", quietly = T)){BiocManager::install("DESeq2", force = TRUE)}; library(DESeq2)
+```
+
+### CRAN
+```{r}
+# Check if pacman is available and install
+if(!require("pacman", quietly = T)){install.packages("pacman")}; library(pacman)
+
+# use packman to install CRAN packages
+p_load(tidyverse, ggpubr, data.table, ggfortify, stats)
+```
+
+## Set directories
+```{r}
+# input directory
+if(!dir.exists("INPUT")){
+  dir.create(path = file.path(getwd(), "INPUT"))
+}
+input_dir <- file.path(getwd(), "INPUT")
+
+# output directory
+if(!dir.exists("OUTPUT")){
+  dir.create(path = file.path(getwd(), "OUTPUT"))
+}
+output_dir <- file.path(getwd(), "OUTPUT")
+```
+
+## Load functions
+```{r}
+# Function: tidy check deseq input  ----
+tidy_check = function(countdata, metadata) {
+  # We assume first column will contain the row names (tidy = T in DESeqDataSetFromMatrix)
+  names_count = names(countdata)[-1]
+  # Not obligatory for DEseq2, but we want row names in the first column
+  names_meta = metadata[[1]]
+  # Test if the names from the count and metadata are identical (same entries, same order)
+  identical = identical(names_count, names_meta)
+  # If not identical, do we have the same entries (ignores duplicates)
+  setequal = identical || setequal(names_count, names_meta)
+  # Test for duplicates (in theory, but very unlikely, this can also happen if identical is true)
+  has_duplicates = anyDuplicated(names_meta) > 0
+  # If the names are not identical, but we're looking at the same entries without duplicates,
+  # then the problem is the order of the entries
+  problem_is_order = !identical && setequal && !has_duplicates
+  # List possibilities to test
+  input = list(identical = identical, setequal = setequal, has_duplicates = has_duplicates, problem_is_order = problem_is_order)
+
+  if(input$identical & input$setequal & !input$has_duplicates & !input$problem_is_order){
+    return(TRUE)
+  } else {
+    print(input)
+    return(FALSE)
+  }
+}
+```
+
+# Load data {.tabset}
+## Metadata
+```{r}
+metadata = fread(file.path(input_dir, "20240603filtered_metadata_processed_rat.csv"))
+```
+
+## Raw counts
+```{r}
+countdata_raw = fread(file.path(input_dir, "20240603filtered_countdata_raw_processed_rat.csv"))
+```
+
+# Differential gene expression analysis based on the negative binomial distribution (DESeq2 package) {.tabset}
+## Generate contrast
+### Set control condition
+```{r error=F,warning=F,message=F, echo=F}
+control_condition =  c("DMSO")
+```
+
+### Create the `contrast_table`
+```{r error=F,warning=F,message=F, echo=F}
+# We generate a contrast table which contains the mean_id comparison we aim the perform
+contrast_control = metadata %>%
+  filter(COMPOUND %in% control_condition) %>%
+  distinct(MEAN_ID, TIME, COMPOUND)
+
+
+contrast_treatment = metadata %>%
+  filter(!COMPOUND %in% control_condition) %>%
+  distinct(MEAN_ID, TIME, COMPOUND)
+
+
+contrast_table = left_join(x = contrast_treatment %>%
+                             select(MEAN_ID_TREATMENT = MEAN_ID, TIME, EXPERIMENT = COMPOUND),
+                           y = contrast_control %>%
+                             select(MEAN_ID_CONTROL = MEAN_ID, TIME, CONTROL = COMPOUND),
+                           by = "TIME") %>%
+  distinct()
+
+
+contrast_table %>%
+  select(MEAN_ID_TREATMENT, MEAN_ID_CONTROL) %>%
+  as_tibble() %>%
+  print(n = 1000)
+
+
+```
+
+## Run DESeq2
+```{r error=F,warning=F,message=F, echo=F}
+# We set the thresholds to find differential expressed genes
+padj_threshold <- 0.05
+log2FC_threshold <- log2(1.5)
+
+# We loop over the contrast table and select the corresponding data, make the DESeq object, cpm normalize, contrast the treatment with the control and print the ouput
+deseq_results = tibble()
+
+
+  if(nrow(metadata)==ncol(countdata_raw)-1){
+    
+    if(tidy_check(countdata = countdata_raw, metadata = metadata)){
+      deseq_object = DESeqDataSetFromMatrix(countData =  as.data.frame(countdata_raw),
+                                                 colData = metadata %>% mutate(MEAN_ID = as.factor(MEAN_ID)),
+                                                 design = ~ MEAN_ID + REPLICATE,
+                                                 tidy = TRUE)
+    }
+    sizeFactors(deseq_object) = colSums(column_to_rownames(countdata_raw, var = "GENE_SYMBOL"))/1E6
+    deseq_object = DESeq(deseq_object)
+
+    for(i in 1:nrow(contrast_table)){
+    temp = data.frame(
+      results(deseq_object, contrast = c("MEAN_ID", contrast_table$MEAN_ID_TREATMENT[i], contrast_table$MEAN_ID_CONTROL[i]))) %>%
+      rownames_to_column(var = "gene_symbol") %>%
+      mutate(MEAN_ID_TREATMENT = contrast_table$MEAN_ID_TREATMENT[i], 
+             MEAN_ID_CONTROL = contrast_table$MEAN_ID_CONTROL[i]) %>% tibble()
+    
+    
+    up = temp %>% filter(padj < padj_threshold & log2FoldChange >= log2FC_threshold) %>% nrow()
+    down = temp %>% filter(padj < padj_threshold & log2FoldChange <= -log2FC_threshold) %>% nrow()
+    
+    cat(
+      paste("Treatment", contrast_table$MEAN_ID_TREATMENT[i], "vs. control", contrast_table$MEAN_ID_CONTROL[i]), 
+      "\npadj threshold =", padj_threshold, "log2FC threshold =", log2FC_threshold, 
+      "\nUp regulated DEGs =", up, "\nDown regulated DEGs =", down)
+    cat("\n")
+    cat("\n")
+    
+    deseq_results = deseq_results %>% bind_rows(temp)
+  }
+}
+
+# We print the DESeq result table
+{
+  cat("\n")
+  print("DESeq2 output table")
+  cat("\n")
+  deseq_results %>% str()  
+}
+```
+
+# Inspect DESeq2 output {.tabset}
+## Log2FC vs FC
+```{r error=F,warning=F,message=F}
+# We plot a density plot using the foldchange values of the treatment conditions
+deseq_results %>% 
+  select(log2FoldChange, MEAN_ID_TREATMENT) %>% 
+  mutate(FoldChange = 2^log2FoldChange) %>% 
+  ggplot() +
+  geom_density(mapping = aes(x = FoldChange)) +
+  facet_wrap(~MEAN_ID_TREATMENT) +
+  theme_bw() + 
+  labs(title = "Density plot of FoldChange values")
+
+# We ZOOM on x = c(0,10) and plot a density plot using the foldchange values of the treatment conditions
+deseq_results %>% 
+  select(log2FoldChange, MEAN_ID_TREATMENT) %>% 
+  mutate(FoldChange = 2^log2FoldChange) %>% 
+  ggplot() +
+  geom_density(mapping = aes(x = FoldChange)) +
+  facet_wrap(~MEAN_ID_TREATMENT) +
+  theme_bw() + 
+  labs(title = "ZOOM on x = c(0,10) Density plot of FoldChange values") +
+  coord_cartesian(xlim = c(0,10)) +
+  scale_x_continuous(breaks = 0:10)
+
+# We plot a density plot using the log2foldchange values of the treatment conditions
+deseq_results %>% 
+  select(log2FoldChange, MEAN_ID_TREATMENT) %>% 
+  mutate(FoldChange = 2^log2FoldChange) %>% 
+  ggplot() +
+  geom_density(mapping = aes(x = log2FoldChange)) +
+  facet_wrap(~MEAN_ID_TREATMENT) +
+  theme_bw() + 
+  labs(title = "Density plot of log2FoldChange values")
+```
+
+## Number of differentially expressed genes (DEGs)
+```{r error=F,warning=F,message=F}
+padj_threshold <- 0.05
+log2FC_threshold <- log2(1.5)
+
+deseq_results %>% 
+  group_by(MEAN_ID_TREATMENT,.drop = F) %>% 
+  filter(abs(log2FoldChange) > log2FC_threshold & padj < padj_threshold) %>% 
+  dplyr::count(MEAN_ID_TREATMENT) %>% 
+  ggplot(mapping = aes(x = reorder(MEAN_ID_TREATMENT, -n), y = n)) + 
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, size=6))
+```
+
+### Volcano plot
+```{r}
+# Define thresholds
+padj_threshold <- 0.05
+log2FC_threshold <- log2(1.5)
+
+# Define treatment order
+order <- c("RPPTEC_CSA_8hr_2", "RPPTEC_CSA_8hr_10", "RPPTEC_CSA_8hr_40", "RPPTEC_CSA_24hr_2", "RPPTEC_CSA_24hr_10", "RPPTEC_CSA_24hr_40", "RPPTEC_CSA_72hr_2", "RPPTEC_CSA_72hr_10", "RPPTEC_CSA_72hr_40")
+
+# Assign status to every gene
+red <- deseq_results %>%
+  mutate(concentration = as.numeric(sub(".*_(\\d+)$", "\\1", MEAN_ID_TREATMENT))) %>%
+  arrange(concentration) %>%
+  drop_na() %>%
+  mutate(MEAN_ID_TREATMENT = factor(MEAN_ID_TREATMENT, levels = order),  
+         class = if_else(abs(log2FoldChange) > log2FC_threshold & padj < padj_threshold,
+                         "significant",
+                         "not significant"))
+
+# Generate scatter plot with significant and not significant genes per treatment condition
+plot <- ggplot(data = red, aes(x = log2FoldChange, y = -log10(padj), color = class)) + 
+  facet_wrap(~MEAN_ID_TREATMENT, scales = "fixed") +  
+  geom_point(size = 0.5) +
+  geom_text(data = filter(red, abs(log2FoldChange) > 20), aes(label = gene_symbol), vjust = -1, hjust = 1, size = 2, show.legend = FALSE) +  
+  theme_bw()
+
+# Print the plot
+print(plot)
+
+```
+
+## MA plot
+```{r error=F,warning=F,message=F}
+# Assign baseMean and log2FC thresholds
+baseMean_threshold <- 2.5
+log2FC_threshold <- 2.5
+padj_threshold <- 0.05
+
+order <- c("RPPTEC_CSA_8hr_2", "RPPTEC_CSA_8hr_10", "RPPTEC_CSA_8hr_40", "RPPTEC_CSA_24hr_2", "RPPTEC_CSA_24hr_10", "RPPTEC_CSA_24hr_40", "RPPTEC_CSA_72hr_2", "RPPTEC_CSA_72hr_10", "RPPTEC_CSA_72hr_40")
+deseq_results$MEAN_ID_TREATMENT <- factor(deseq_results$MEAN_ID_TREATMENT, levels = order)
+
+# We generate the plot and print the output
+ggplot(data = deseq_results, aes(x = baseMean, y = log2FoldChange)) + 
+  geom_point(size=0.5) +
+  geom_point(data = deseq_results %>% filter(padj < padj_threshold), color = "red", size=0.5) +
+  facet_wrap(~MEAN_ID_TREATMENT) +
+  scale_x_continuous(limits = c(0,10)) +
+  theme_bw() +
+  labs(title = "MA plot with significant genes in red")
+```
+
+#### Principal component analysis on DESeq output using the log2FC values
+```{r error=F,warning=F,message=F}
+
+# We transpose prepare the data frame for pca analysis
+log2fc_results <- deseq_results %>%
+  select(gene_symbol, log2FoldChange, MEAN_ID_TREATMENT) %>%
+  pivot_wider(names_from = MEAN_ID_TREATMENT, values_from = log2FoldChange)
+
+# We print the genes with NA as log2FC result
+print("NA genes dropped from PCA analysis")
+log2fc_results[!!rowSums(is.na(log2fc_results)),]
+
+# We further wrangle the data frame for pca analysis
+pca_data <- log2fc_results %>% 
+  drop_na() %>% 
+  pivot_longer(cols = where(is.numeric), names_to = "MEAN_ID") %>% 
+  pivot_wider(values_from = value, names_from = gene_symbol) %>%
+  left_join(metadata, by="MEAN_ID")
+
+# We perform pca analysis on numerical columns
+pca_object = prcomp(pca_data %>% select(log2fc_results$gene_symbol), center = F, scale. = F)
+
+# We print the output
+  autoplot(object = pca_object, data = pca_data, colour = "TIMEPOINT", size="DOSE") + 
+    theme_bw()
+```
+
+# Create expression data
+```{r}
+expression_long = deseq_results %>% 
+  dplyr::select(sample_id = MEAN_ID_TREATMENT,
+                gene_symbol,
+                log2fc = log2FoldChange,
+                pvalue,
+                padj)
+
+
+# add columns needed for TXG-MAPr
+expression_long_TXG <- left_join(expression_long, metadata %>%
+                                   dplyr::select("experiment" = "COMPOUND", "time" = "TIME", "conc" = "DOSE", "sample_id" = "MEAN_ID"),
+                                 by = c("sample_id")) %>%
+  dplyr::rename("gene_id" = "gene_symbol") %>%
+  mutate(time = gsub("hr", "", time), # remove hr from time
+         conc = gsub("uM", "", conc)) %>% # remove uM from conc
+  select(everything(), -"sample_id")
+
+```
+
+# Save output
+```{r}
+write_rds(deseq_results, file.path(output_dir, paste0(gsub( "-", "", Sys.Date()), "_DESeq2_results_unformatted_rat2.rds")))
+write_delim(expression_long_TXG, file.path(output_dir, paste0(gsub( "-", "", Sys.Date()), "_expression_long_TXG_upload_rat2.txt")))
+
+```
